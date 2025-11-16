@@ -3,6 +3,21 @@ import streamlit as st
 import pandas as pd
 import math
 
+import io, json, hashlib, time, os
+from datetime import datetime
+from typing import Dict, Any, Callable
+
+# Optional OCR for image input
+try:
+    import pytesseract
+    from PIL import Image
+    HAS_OCR = True
+except Exception:
+    HAS_OCR = False
+
+# Which plan gets Tier-5 features (you can change this later)
+TIER5_REQUIRED_PLAN = "pro"
+
 # ------------------------------------------------------------
 # PAGE
 # ------------------------------------------------------------
@@ -18,10 +33,12 @@ def get_supabase() -> Client:
     key = st.secrets["SUPABASE_ANON_KEY"]
     return create_client(url, key)
 
+
 supabase = get_supabase()
 
-# temporary: pretend this is the logged-in user
-DEMO_USER_ID = "e29394b6-5f7a-4aa7-8d30-9155165733e3"
+# temporary: pretend this is the logged-in user for reagents
+DEMO_USER_ID = "ff24c2dd-ea12-4f64-9a71-1d3c65df0647"
+
 
 def load_reagents(user_id: str):
     data = (
@@ -33,6 +50,7 @@ def load_reagents(user_id: str):
     )
     return data.data or []
 
+
 if "fav_reagents" not in st.session_state:
     st.session_state["fav_reagents"] = []
 
@@ -42,21 +60,81 @@ for r in reagents_db:
         st.session_state["fav_reagents"].append(r["name"])
 
 # ------------------------------------------------------------
+# Tier-5 helpers (hash, logging)
+# ------------------------------------------------------------
+def hash_api_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def save_run_to_cloud(
+    mode: str,
+    params: Dict[str, Any],
+    result: Dict[str, Any],
+    status: str = "done",
+    error: str | None = None,
+    upload_id: str | None = None,
+    user_id: str | None = None,
+):
+    """Log a run in public.runs (best effort, no crash)."""
+    try:
+        supabase.table("runs").insert(
+            {
+                "user_id": user_id,
+                "mode": mode,
+                "params": params,
+                "result": result,
+                "status": status,
+                "error": error,
+                "source_upload": upload_id,
+            }
+        ).execute()
+    except Exception:
+        pass
+
+
+def save_chat_msg(
+    session_id: str | None,
+    sender: str,
+    content: str,
+    tool_called: str | None = None,
+    tool_input: Dict[str, Any] | None = None,
+    tool_output: Dict[str, Any] | None = None,
+):
+    if not session_id:
+        return
+    try:
+        supabase.table("chat_messages").insert(
+            {
+                "session_id": session_id,
+                "sender": sender,
+                "content": content,
+                "tool_called": tool_called,
+                "tool_input": tool_input,
+                "tool_output": tool_output,
+            }
+        ).execute()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------
 # 3) Auth helpers
 # ------------------------------------------------------------
 def login(email: str, password: str):
     """Sign in user with email+password."""
     return supabase.auth.sign_in_with_password({"email": email, "password": password})
 
+
 def signup(email: str, password: str, full_name: str = ""):
     """Create new user (will trigger your SQL to create profile + subscription=free)."""
-    return supabase.auth.sign_up({
-        "email": email,
-        "password": password,
-        "options": {
-            "data": {"full_name": full_name}
+    return supabase.auth.sign_up(
+        {
+            "email": email,
+            "password": password,
+            "options": {"data": {"full_name": full_name}},
         }
-    })
+    )
+
 
 def logout():
     try:
@@ -68,7 +146,8 @@ def logout():
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
-    
+
+
 def get_subscription_plan(user_id: str) -> str:
     """
     Try to read the user's plan from public.subscriptions.
@@ -76,8 +155,7 @@ def get_subscription_plan(user_id: str) -> str:
     """
     try:
         resp = (
-            supabase
-            .table("subscriptions")
+            supabase.table("subscriptions")
             .select("plan")
             .eq("user_id", user_id)
             .limit(1)
@@ -92,6 +170,7 @@ def get_subscription_plan(user_id: str) -> str:
         st.info("Could not read subscription from Supabase → using FREE.")
         st.write(e)  # you can remove this later
         return "free"
+
 
 # ------------------------------------------------------------
 # 4) LOGIN GATE
@@ -124,7 +203,7 @@ if st.session_state["user"] is None:
         spass = st.text_input("Password (min 6 chars)", type="password", key="signup_password")
         if st.button("Create account"):
             try:
-                sres = signup(semail, spass, sname)
+                signup(semail, spass, sname)
                 st.success("Account created. Now login from the Login tab.")
             except Exception as e:
                 st.error(f"Signup failed: {e}")
@@ -143,13 +222,12 @@ if plan != "pro":
     st.info("Ask admin to upgrade you in Supabase → public.subscriptions, or connect Stripe later.")
     st.stop()
 
-
-    
 # ------------------------------------------------------------
 # optional PDF
 # ------------------------------------------------------------
 try:
     from fpdf import FPDF
+
     HAS_FPDF = True
 except Exception:
     HAS_FPDF = False
@@ -239,7 +317,7 @@ max_vehicle = st.sidebar.number_input(
     value=_default_max_vehicle,
     min_value=0.0,
     step=0.05,
-    help="Typical cell culture limit is 0.1–0.5 %."
+    help="Typical cell culture limit is 0.1–0.5 %.",
 )
 
 vehicle_type = st.sidebar.selectbox(
@@ -304,7 +382,7 @@ mode = st.selectbox(
         "Plate DMSO cap checker",
         "Aliquot splitter",
         "Storage / stability helper",
-    ]
+    ],
 )
 
 # share calculation (stores mode in URL)
@@ -368,7 +446,7 @@ if mode == "Single dilution (C1V1 = C2V2)":
         if HAS_FPDF:
             if st.button("📄 Export this as PDF"):
                 lines = [
-                    f"Mode: Single dilution",
+                    "Mode: Single dilution",
                     f"Stock: {stock_conc} {stock_unit}",
                     f"Target: {target_conc} {target_unit}",
                     f"Final volume: {well_volume} µl",
@@ -405,15 +483,17 @@ elif mode == "Serial dilutions":
         if v1_ul < min_pip:
             warning_flag = "<1 µl → make intermediate"
 
-        rows.append({
-            "step": i + 1,
-            "from (mM)": round(current_conc, 6),
-            "to (mM)": round(next_conc, 6),
-            "take from prev (µl)": round(v1_ul, 3),
-            "add solvent (µl)": round(solvent_ul, 3),
-            "vehicle %": round(vehicle_percent, 5),
-            "note": warning_flag,
-        })
+        rows.append(
+            {
+                "step": i + 1,
+                "from (mM)": round(current_conc, 6),
+                "to (mM)": round(next_conc, 6),
+                "take from prev (µl)": round(v1_ul, 3),
+                "add solvent (µl)": round(solvent_ul, 3),
+                "vehicle %": round(vehicle_percent, 5),
+                "note": warning_flag,
+            }
+        )
 
         current_conc = next_conc
 
@@ -443,7 +523,9 @@ elif mode == "Experiment series (plate-like)":
     stock_conc_uM = st.number_input("Stock concentration (µM)", value=10000.0, min_value=0.0001)
 
     reps = st.number_input("Replicates per concentration (wells)", value=3, min_value=1, step=1)
-    overfill = st.number_input("Overfill factor (1.0 = exact, 1.1 = +10%)", value=1.1, min_value=1.0, step=0.05)
+    overfill = st.number_input(
+        "Overfill factor (1.0 = exact, 1.1 = +10%)", value=1.1, min_value=1.0, step=0.05
+    )
 
     concs = [float(x.strip()) for x in conc_txt.split(",") if x.strip()]
     table = []
@@ -453,14 +535,16 @@ elif mode == "Experiment series (plate-like)":
         vehicle_percent = (v1_ul * vehicle_frac / well_volume) * 100
         total_vol_ul = (v1_ul + solvent_ul) * reps * overfill
 
-        table.append({
-            "final conc (µM)": c,
-            "add stock (µl) / well": round(v1_ul, 3),
-            "add medium (µl) / well": round(solvent_ul, 3),
-            "vehicle %": round(vehicle_percent, 5),
-            "OK?": "⚠ > limit" if vehicle_percent > max_vehicle else "✅",
-            "total vol to prepare (µl)": round(total_vol_ul, 1),
-        })
+        table.append(
+            {
+                "final conc (µM)": c,
+                "add stock (µl) / well": round(v1_ul, 3),
+                "add medium (µl) / well": round(solvent_ul, 3),
+                "vehicle %": round(vehicle_percent, 5),
+                "OK?": "⚠ > limit" if vehicle_percent > max_vehicle else "✅",
+                "total vol to prepare (µl)": round(total_vol_ul, 1),
+            }
+        )
 
     df = pd.DataFrame(table)
     st.dataframe(df)
@@ -470,7 +554,7 @@ elif mode == "Experiment series (plate-like)":
         "⬇ Download dilution plan as CSV",
         csv,
         "dilution_plan.csv",
-        "text/csv"
+        "text/csv",
     )
 
     if HAS_FPDF:
@@ -490,7 +574,14 @@ elif mode == "From solid (mg → solution)":
 
     compound = st.selectbox(
         "Choose compound (optional)",
-        ["-- custom --", "Retinal (284.44)", "AMPA (192.17)", "Forskolin (410.5)", "Retinoic acid (300.44)", "GABA (103.12)"]
+        [
+            "-- custom --",
+            "Retinal (284.44)",
+            "AMPA (192.17)",
+            "Forskolin (410.5)",
+            "Retinoic acid (300.44)",
+            "GABA (103.12)",
+        ],
     )
 
     light_sensitive_words = ["retinal", "retinoic", "rhodamine", "fitc"]
@@ -521,20 +612,22 @@ elif mode == "From solid (mg → solution)":
     final_vol_ml = st.number_input("Final volume to prepare (mL)", value=20.0, min_value=0.1)
 
     if target_unit == "µM":
-        C = target_conc * 1e-6   # mol/L
+        C = target_conc * 1e-6  # mol/L
     else:
-        C = target_conc * 1e-3   # mol/L
+        C = target_conc * 1e-3  # mol/L
 
     V_L = final_vol_ml / 1000.0
     m_needed_g = C * V_L * mw
     m_needed_mg = m_needed_g * 1000
 
-    st.markdown(f"**To make {final_vol_ml:.1f} mL at {target_conc} {target_unit}, you must weigh ≈ {m_needed_mg:.3f} mg.**")
+    st.markdown(
+        f"**To make {final_vol_ml:.1f} mL at {target_conc} {target_unit}, you must weigh ≈ {m_needed_mg:.3f} mg.**"
+    )
 
     # if I dissolve everything
     mass_g = mass_mg / 1000.0
     n_mol = mass_g / mw
-    stock_if_1ml_mM = (n_mol / 0.001) * 1000   # mol/L → mM
+    stock_if_1ml_mM = (n_mol / 0.001) * 1000  # mol/L → mM
     stock_if_2ml_mM = (n_mol / 0.002) * 1000
 
     st.write("If you dissolve ALL your powder:")
@@ -543,28 +636,31 @@ elif mode == "From solid (mg → solution)":
 
     name_to_check = (compound_name or "").lower()
     if any(word in name_to_check for word in light_sensitive_words):
-        st.warning("This compound looks light-sensitive. Protect from light (amber tube / foil), use dry EtOH or DMSO, aliquot, store cold.")
+        st.warning(
+            "This compound looks light-sensitive. Protect from light (amber tube / foil), "
+            "use dry EtOH or DMSO, aliquot, store cold."
+        )
 
     # save to favorites
     if st.button("⭐ Save this reagent to my favorites"):
-       if compound_name:
-        # save in session
-        if compound_name not in st.session_state["fav_reagents"]:
-            st.session_state["fav_reagents"].append(compound_name)
+        if compound_name:
+            # save in session
+            if compound_name not in st.session_state["fav_reagents"]:
+                st.session_state["fav_reagents"].append(compound_name)
 
-        # save in Supabase
-        supabase.table("reagents").insert(
-            {
-                "user_id": DEMO_USER_ID,
-                "name": compound_name,
-                "mw": mw,
-                "note": "from app",
-            }
-        ).execute()
+            # save in Supabase
+            supabase.table("reagents").insert(
+                {
+                    "user_id": DEMO_USER_ID,
+                    "name": compound_name,
+                    "mw": mw,
+                    "note": "from app",
+                }
+            ).execute()
 
-        st.success(f"Saved '{compound_name}' to Supabase + session.")
-    else:
-        st.warning("Give the compound a name first.")
+            st.success(f"Saved '{compound_name}' to Supabase + session.")
+        else:
+            st.warning("Give the compound a name first.")
 
     if HAS_FPDF:
         if st.button("📄 Export this as PDF"):
@@ -614,7 +710,9 @@ elif mode == "% solutions (w/v, v/v)":
         st.success(f"To make {percent}% w/v, weigh **{grams_needed:.3f} g** and bring volume to {final_vol_ml:.1f} mL.")
     else:
         ml_needed = (percent / 100.0) * final_vol_ml
-        st.success(f"To make {percent}% v/v, measure **{ml_needed:.3f} mL** of solute and add solvent to {final_vol_ml:.1f} mL.")
+        st.success(
+            f"To make {percent}% v/v, measure **{ml_needed:.3f} mL** of solute and add solvent to {final_vol_ml:.1f} mL."
+        )
 
 # ======================================================================
 # 7) MOLARITY FROM MASS & VOLUME
@@ -661,7 +759,9 @@ elif mode == "Master mix / qPCR mix":
 
     n_rxn = st.number_input("Number of reactions", value=10, min_value=1, step=1)
     rxn_vol_ul = st.number_input("Reaction volume (µl)", value=20.0, min_value=5.0)
-    overfill = st.number_input("Overfill factor (1.0 = exact, 1.1 = +10%)", value=1.1, min_value=1.0, step=0.05)
+    overfill = st.number_input(
+        "Overfill factor (1.0 = exact, 1.1 = +10%)", value=1.1, min_value=1.0, step=0.05
+    )
 
     st.write("Specify components in µL per reaction:")
     col1, col2, col3 = st.columns(3)
@@ -818,12 +918,14 @@ elif mode == "Plate DMSO cap checker":
     for c in concs:
         v1_ul = (c * well_volume) / stock_conc_uM
         dmso_percent = (v1_ul * vehicle_frac / well_volume) * 100
-        rows.append({
-            "final conc (µM)": c,
-            "stock vol (µl)": round(v1_ul, 3),
-            "DMSO / EtOH %": round(dmso_percent, 5),
-            "OK?": "✅" if dmso_percent <= dmso_cap else "⚠ EXCEEDS",
-        })
+        rows.append(
+            {
+                "final conc (µM)": c,
+                "stock vol (µl)": round(v1_ul, 3),
+                "DMSO / EtOH %": round(dmso_percent, 5),
+                "OK?": "✅" if dmso_percent <= dmso_cap else "⚠ EXCEEDS",
+            }
+        )
 
     df = pd.DataFrame(rows)
     st.dataframe(df)
@@ -874,7 +976,278 @@ else:  # "Storage / stability helper"
     if out:
         st.success(out)
     else:
-        st.info("No specific rule found. General rule: store at 4°C for short term, -20°C for long term, protect from light if colored/retinoid.")
+        st.info(
+            "No specific rule found. General rule: store at 4°C for short term, -20°C for long term, "
+            "protect from light if colored/retinoid."
+        )
+
+# ------------------------------------------------------------
+# Tier-5: function registry for chat & batch
+# ------------------------------------------------------------
+def calc_single(stock_conc, target_conc, final_ul, vehicle_frac):
+    v1_ul = (target_conc * final_ul) / stock_conc
+    solvent_ul = max(final_ul - v1_ul, 0.0)
+    vehicle_percent = (v1_ul * vehicle_frac / final_ul) * 100 if final_ul > 0 else 0
+    return {
+        "add_stock_ul": round(v1_ul, 4),
+        "add_solvent_ul": round(solvent_ul, 4),
+        "vehicle_percent": round(vehicle_percent, 6),
+    }
+
+
+def calc_unit_mgml_to_mM(mg_per_ml, mw):
+    return {"mM": (mg_per_ml * 1000.0) / mw}
+
+
+def calc_unit_mM_to_mgml(mM, mw):
+    return {"mg_per_ml": (mM * mw) / 1000.0}
+
+
+CALC_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
+    "single_dilution": calc_single,
+    "mgml_to_mM": calc_unit_mgml_to_mM,
+    "mM_to_mgml": calc_unit_mM_to_mgml,
+}
+
+# ------------------------------------------------------------
+# Tier-5 UI: Chat • Batch • Image • Cloud • API keys
+# ------------------------------------------------------------
+st.markdown("---")
+st.header("⚡ Tier-5: Chat • Batch • Image • Cloud • API")
+
+if plan != TIER5_REQUIRED_PLAN:
+    st.info(f"Tier-5 features require **{TIER5_REQUIRED_PLAN}**. Contact admin to upgrade.")
+else:
+    tab_chat, tab_batch, tab_image, tab_cloud, tab_keys = st.tabs(
+        ["Chat interface", "Batch calculator", "Image input", "DataLens Cloud", "API keys"]
+    )
+
+    # --- (A) Chat interface ---
+    with tab_chat:
+        st.subheader("Chat with your Lab Assistant")
+
+        if "chat_session_id" not in st.session_state:
+            title = f"Session {datetime.utcnow().isoformat(timespec='seconds')}"
+            try:
+                res = (
+                    supabase.table("chat_sessions")
+                    .insert({"user_id": user.id, "title": title})
+                    .execute()
+                )
+                st.session_state["chat_session_id"] = res.data[0]["id"]
+            except Exception:
+                st.session_state["chat_session_id"] = None
+
+        chat_session_id = st.session_state.get("chat_session_id")
+
+        # load history
+        history = []
+        if chat_session_id:
+            try:
+                msgs = (
+                    supabase.table("chat_messages")
+                    .select("*")
+                    .eq("session_id", chat_session_id)
+                    .order("created_at", desc=False)
+                    .execute()
+                )
+                history = msgs.data or []
+            except Exception:
+                history = []
+
+        for m in history:
+            with st.chat_message(m["sender"]):
+                st.markdown(m["content"])
+                if m.get("tool_output"):
+                    st.caption(f"Tool: {m.get('tool_called')}")
+                    st.json(m["tool_output"])
+
+        prompt = st.chat_input(
+            "e.g., Make 10 µM from 10 mM in 300 µL; or Convert 1 mg/mL to mM (MW 284.44)"
+        )
+        if prompt:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            save_chat_msg(chat_session_id, "user", prompt)
+
+            tool, args = None, {}
+            t = prompt.lower()
+
+            try:
+                # mg/mL → mM
+                if "mg/ml" in t and "mm" in t and "convert" in t:
+                    vals = [float(x) for x in t.replace("/", " ").split() if x.replace(".", "", 1).isdigit()]
+                    if len(vals) >= 2:
+                        tool = "mgml_to_mM"
+                        args = {"mg_per_ml": vals[0], "mw": vals[1]}
+
+                # single dilution
+                elif "make" in t and "from" in t and ("µm" in t or "um" in t) and ("mm" in t):
+                    nums = [float(x) for x in t.replace("µ", "u").split() if x.replace(".", "", 1).isdigit()]
+                    if len(nums) >= 2:
+                        target, stock = nums[0], nums[1]
+                        vol = nums[2] if len(nums) >= 3 else well_volume
+                        tool = "single_dilution"
+                        args = {
+                            "stock_conc": stock,
+                            "target_conc": target,
+                            "final_ul": vol,
+                            "vehicle_frac": vehicle_frac,
+                        }
+
+                if tool is None:
+                    msg = (
+                        "I can run:\n"
+                        "- **single_dilution** – ‘Make 10 µM from 10 mM in 300 µL’\n"
+                        "- **mg/mL↔mM** – ‘Convert 1 mg/mL to mM (MW 284.44)’"
+                    )
+                    with st.chat_message("assistant"):
+                        st.markdown(msg)
+                    save_chat_msg(chat_session_id, "assistant", msg)
+                else:
+                    out = CALC_REGISTRY[tool](**args)
+                    with st.chat_message("assistant"):
+                        st.markdown(f"**Tool:** `{tool}`")
+                        st.json(out)
+                    save_chat_msg(
+                        chat_session_id,
+                        "assistant",
+                        f"Ran `{tool}`",
+                        tool_called=tool,
+                        tool_input=args,
+                        tool_output=out,
+                    )
+                    save_run_to_cloud(tool, args, out, user_id=user.id)
+            except Exception as e:
+                err = f"Error: {e}"
+                with st.chat_message("assistant"):
+                    st.error(err)
+                save_chat_msg(chat_session_id, "assistant", err)
+
+    # --- (B) Batch calculator ---
+    with tab_batch:
+        st.subheader("Batch calculator (CSV)")
+        st.code(
+            """mode,stock_mM,target_mM,final_ul
+single_dilution,10,0.01,300
+
+mode,mg_per_ml,mw
+mgml_to_mM,1,284.44
+
+mode,mM,mw
+mM_to_mgml,10,284.44
+""",
+            language="csv",
+        )
+
+        up = st.file_uploader("Upload CSV", type=["csv"])
+        if up is not None:
+            df_in = pd.read_csv(up)
+            out_rows = []
+            for _, row in df_in.iterrows():
+                try:
+                    m = row["mode"]
+                    if m == "single_dilution":
+                        out = CALC_REGISTRY["single_dilution"](
+                            stock_conc=float(row["stock_mM"]),
+                            target_conc=float(row["target_mM"]),
+                            final_ul=float(row["final_ul"]),
+                            vehicle_frac=vehicle_frac,
+                        )
+                    elif m == "mgml_to_mM":
+                        out = CALC_REGISTRY["mgml_to_mM"](
+                            mg_per_ml=float(row["mg_per_ml"]),
+                            mw=float(row["mw"]),
+                        )
+                    elif m == "mM_to_mgml":
+                        out = CALC_REGISTRY["mM_to_mgml"](mM=float(row["mM"]), mw=float(row["mw"]))
+                    else:
+                        out = {"error": f"Unsupported mode: {m}"}
+                    out_rows.append({**row.to_dict(), **out})
+                except Exception as e:
+                    out_rows.append({**row.to_dict(), "error": str(e)})
+
+            df_out = pd.DataFrame(out_rows)
+            st.dataframe(df_out)
+            st.download_button(
+                "⬇ Download results",
+                df_out.to_csv(index=False).encode("utf-8"),
+                "batch_results.csv",
+                "text/csv",
+            )
+            save_run_to_cloud("batch", {"rows": len(df_in)}, {"rows": len(df_out)}, user_id=user.id)
+
+    # --- (C) Image input / OCR ---
+    with tab_image:
+        st.subheader("Image input / OCR")
+        if not HAS_OCR:
+            st.info("Enable OCR: `pip install pytesseract pillow` and install Tesseract binary.")
+        img_file = st.file_uploader("Upload label/plate image", type=["png", "jpg", "jpeg"])
+        if img_file and HAS_OCR:
+            img = Image.open(img_file)
+            st.image(img, caption="Uploaded")
+            text = pytesseract.image_to_string(img)
+            st.text_area("OCR text", value=text, height=200)
+
+    # --- (D) DataLens Cloud ---
+    with tab_cloud:
+        st.subheader("Cloud uploads & recent runs")
+        cfile = st.file_uploader("Upload to cloud", key="cloud_up", type=["png", "jpg", "jpeg", "csv", "pdf"])
+        if cfile:
+            content = cfile.read()
+            path = f"{int(time.time())}_{cfile.name}"
+            try:
+                supabase.storage.from_("datalens-uploads").upload(path, content)
+                supabase.table("uploads").insert(
+                    {
+                        "user_id": user.id,
+                        "filename": cfile.name,
+                        "mime_type": cfile.type,
+                        "storage_path": path,
+                        "bytes": len(content),
+                    }
+                ).execute()
+                st.success(f"Uploaded: {cfile.name}")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+        try:
+            runs = (
+                supabase.table("runs")
+                .select("*")
+                .eq("user_id", user.id)
+                .order("created_at", desc=True)
+                .limit(20)
+                .execute()
+            )
+            st.dataframe(pd.DataFrame(runs.data) if runs.data else pd.DataFrame())
+        except Exception:
+            st.info("No runs yet.")
+
+    # --- (E) API keys ---
+    with tab_keys:
+        st.subheader("API keys (for external access)")
+        new_name = st.text_input("Key name", "")
+        if st.button("Generate API key") and new_name:
+            raw = "dlk_" + hashlib.sha256(f"{time.time()}_{new_name}".encode()).hexdigest()[:40]
+            try:
+                supabase.table("api_keys").insert(
+                    {
+                        "name": new_name,
+                        "key_hash": hash_api_key(raw),
+                    }
+                ).execute()
+                st.success(f"**Save this key now**: `{raw}`")
+                st.caption("Only the hash is stored; you won’t see the raw key again.")
+            except Exception as e:
+                st.error(f"Could not create key: {e}")
+
+        try:
+            keys = supabase.table("api_keys").select("id,name,created_at,last_used_at").execute()
+            st.write("Existing keys")
+            st.dataframe(pd.DataFrame(keys.data) if keys.data else pd.DataFrame())
+        except Exception:
+            st.info("No keys yet.")
 
 # ------------------------------------------------------------
 # FOOTER
