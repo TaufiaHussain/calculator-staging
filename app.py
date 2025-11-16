@@ -11,8 +11,17 @@ from typing import Dict, Any, Callable
 try:
     import pytesseract
     from PIL import Image
-    HAS_OCR = True
+    from pytesseract import TesseractNotFoundError
+
+    # check if the Tesseract binary is actually available
+    try:
+        _ = pytesseract.get_tesseract_version()
+        HAS_OCR = True
+    except TesseractNotFoundError:
+        HAS_OCR = False
 except Exception:
+    pytesseract = None
+    Image = None
     HAS_OCR = False
 
 # Which plan gets Tier-5 features (you can change this later)
