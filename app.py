@@ -208,6 +208,9 @@ def save_chat_msg(
     except Exception:
         pass
 
+def hash_api_key(raw: str) -> str:
+    """Return a hex sha256 hash of the raw API key string."""
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 # ------------------------------------------------------------
 # 3) Auth helpers
@@ -1600,28 +1603,35 @@ mM_to_mgml,10,284.44
 
     # --- (E) API keys ---
     with tab_keys:
-        st.subheader("API keys (for external access)")
-        new_name = st.text_input("Key name", "")
-        if st.button("Generate API key") and new_name:
-            raw = "dlk_" + hashlib.sha256(f"{time.time()}_{new_name}".encode()).hexdigest()[:40]
-            try:
-                supabase.table("api_keys").insert(
-                    {
-                        "name": new_name,
-                        "key_hash": hash_api_key(raw),
-                    }
-                ).execute()
-                st.success(f"**Save this key now**: `{raw}`")
-                st.caption("Only the hash is stored; you won’t see the raw key again.")
-            except Exception as e:
-                st.error(f"Could not create key: {e}")
+       st.subheader("API keys (for external access)")
+    new_name = st.text_input("Key name", "")
 
+    if st.button("Generate API key") and new_name:
+        raw = "dlk_" + hashlib.sha256(f"{time.time()}_{new_name}".encode()).hexdigest()[:40]
         try:
-            keys = supabase.table("api_keys").select("id,name,created_at,last_used_at").execute()
-            st.write("Existing keys")
-            st.dataframe(pd.DataFrame(keys.data) if keys.data else pd.DataFrame())
-        except Exception:
-            st.info("No keys yet.")
+            supabase.table("api_keys").insert(
+                {
+                    "user_id": user.id,          # 👈 important
+                    "name": new_name,
+                    "key_hash": hash_api_key(raw),
+                }
+            ).execute()
+            st.success(f"**Save this key now**: `{raw}`")
+            st.caption("Only the hash is stored; you won’t see the raw key again.")
+        except Exception as e:
+            st.error(f"Could not create key: {e}")
+
+    try:
+        keys = (
+            supabase.table("api_keys")
+            .select("id,name,created_at,last_used_at")
+            .eq("user_id", user.id)           # 👈 only your keys
+            .execute()
+        )
+        st.write("Existing keys")
+        st.dataframe(pd.DataFrame(keys.data) if keys.data else pd.DataFrame())
+    except Exception:
+        st.info("No keys yet.")
 
 # ------------------------------------------------------------
 # FOOTER
