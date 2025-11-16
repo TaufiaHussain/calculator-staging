@@ -1,4 +1,8 @@
 streamlit
 supabase
-fpdf
 pandas
+fpdf
+pillow
+pytesseract
+fastapi
+uvicorn
