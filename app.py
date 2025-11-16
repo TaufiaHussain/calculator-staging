@@ -1188,15 +1188,32 @@ mM_to_mgml,10,284.44
 
     # --- (C) Image input / OCR ---
     with tab_image:
-        st.subheader("Image input / OCR")
+        st.subheader("Image input (labels/plates)")
+
         if not HAS_OCR:
-            st.info("Enable OCR: `pip install pytesseract pillow` and install Tesseract binary.")
-        img_file = st.file_uploader("Upload label/plate image", type=["png", "jpg", "jpeg"])
-        if img_file and HAS_OCR:
-            img = Image.open(img_file)
-            st.image(img, caption="Uploaded")
-            text = pytesseract.image_to_string(img)
-            st.text_area("OCR text", value=text, height=200)
+            st.info(
+                "OCR is not available on this deployment (Tesseract engine missing). "
+                "You can still upload images under **DataLens Cloud** to store them, "
+                "and run OCR locally on your own computer."
+            )
+
+        image_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"])
+
+        if image_file is not None:
+            if HAS_OCR:
+                img = Image.open(image_file)
+                st.image(img, caption="Uploaded")
+                try:
+                    text = pytesseract.image_to_string(img)
+                    st.text_area("OCR text", value=text, height=200)
+                    st.caption("Tip: copy values into the calculators above.")
+                except Exception as e:
+                    st.error(f"OCR failed: {e}")
+            else:
+                st.warning(
+                    "Image uploaded, but OCR is disabled here because Tesseract is not installed "
+                    "on the server. Use a local copy of the app for OCR."
+                )
 
     # --- (D) DataLens Cloud ---
     with tab_cloud:
