@@ -2,10 +2,18 @@ from supabase import create_client, Client
 import streamlit as st
 import pandas as pd
 import math
+import re
+import datetime as dt
 
+import hashlib, time  # time already used for filenames / ids
 import io, json, hashlib, time, os
 from datetime import datetime
 from typing import Dict, Any, Callable
+
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 # Optional OCR for image input
 try:
@@ -67,6 +75,81 @@ reagents_db = load_reagents(DEMO_USER_ID)
 for r in reagents_db:
     if r["name"] not in st.session_state["fav_reagents"]:
         st.session_state["fav_reagents"].append(r["name"])
+
+# -------------------- TIER-4 HELPERS --------------------
+# Protein extinction / MW from sequence
+AA_MASS = {
+    "A": 89.09, "R": 174.20, "N": 132.12, "D": 133.10, "C": 121.15,
+    "E": 147.13, "Q": 146.15, "G": 75.07, "H": 155.16, "I": 131.17,
+    "L": 131.17, "K": 146.19, "M": 149.21, "F": 165.19, "P": 115.13,
+    "S": 105.09, "T": 119.12, "W": 204.23, "Y": 181.19, "V": 117.15
+}
+def protein_props_from_seq(seq: str):
+    s = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", seq.upper())
+    length = len(s)
+    nW, nY, nC = s.count("W"), s.count("Y"), s.count("C") // 2  # assume half form cystine
+    # ε at 280 nm (M^-1 cm^-1)
+    epsilon = nW*5500 + nY*1490 + nC*125
+    # MW (Da) — subtract water for peptide bonds: MW ≈ sum - (n-1)*18.015
+    mw = sum(AA_MASS[a] for a in s) - max(0, length-1)*18.015
+    return dict(length=length, nW=nW, nY=nY, nCystine=nC, epsilon=epsilon, mw=mw)
+
+# Henderson–Hasselbalch (monoprotic)
+def hh_pH(pKa, base_molar, acid_molar):
+    if acid_molar <= 0: return None
+    return pKa + math.log10(max(base_molar, 1e-12)/acid_molar)
+
+# Osmolarity (sum of i*C) in Osm/L
+VAN_T_HOFF = {"NaCl":2, "KCl":2, "CaCl2":3, "MgCl2":3, "Glucose":1, "Sucrose":1, "Urea":1}
+def osmolarity(components):
+    # components = list of dicts: {"name":str, "C_mM":float}
+    Osm = 0.0
+    for c in components:
+        i = VAN_T_HOFF.get(c["name"], 1)
+        Osm += i * (c["C_mM"]/1000.0)
+    return Osm  # Osm/L
+
+# Density table (g/mL) — approximate at 20–25°C
+DENSITY = {
+    "water": 0.998, "ethanol_100%": 0.789, "ethanol_70%": 0.867, "glycerol_100%": 1.261,
+    "dmsO_100%": 1.100, "acetone_100%": 0.791
+}
+
+# Simple rules for incompatibility/precipitation flags
+RULES = [
+    ("phosphate buffer", "calcium", "Risk of Ca3(PO4)2 precipitation in high Ca2+."),
+    ("dmso", "naoh", "Strong base may react with DMSO; avoid prolonged contact."),
+    ("ethanol", "naoh", "Ethanol + strong base can form ethoxide; watch temperature."),
+    ("triton", "protein quant", "Triton interferes with some dye-binding assays."),
+    ("methanol", "pvp", "PVP can precipitate in high alcohol."),
+]
+
+def check_compatibility(text):
+    t = text.lower()
+    hits = []
+    for a,b,msg in RULES:
+        if a in t and b in t:
+            hits.append(msg)
+    return hits
+
+# Linear regression (for spectrophotometry standard curves) if NumPy exists
+def simple_linreg(x, y):
+    if np is None or len(x) < 2: return None
+    x = np.array(x, dtype=float); y = np.array(y, dtype=float)
+    n = len(x)
+    xm, ym = x.mean(), y.mean()
+    ss_xy = ((x - xm) * (y - ym)).sum()
+    ss_xx = ((x - xm)**2).sum()
+    if ss_xx == 0: return None
+    slope = ss_xy / ss_xx
+    intercept = ym - slope*xm
+    # R^2
+    ss_yy = ((y - ym)**2).sum()
+    yhat = slope*x + intercept
+    ss_res = ((y - yhat)**2).sum()
+    r2 = 1 - ss_res/ss_yy if ss_yy>0 else 0
+    return dict(slope=slope, intercept=intercept, r2=r2)
+# --------------------------------------------------------
 
 # ------------------------------------------------------------
 # Tier-5 helpers (hash, logging)
@@ -391,6 +474,18 @@ mode = st.selectbox(
         "Plate DMSO cap checker",
         "Aliquot splitter",
         "Storage / stability helper",
+        "Protein extinction / MW from sequence",
+        "pH & buffer capacity",
+        "Cell culture media designer",
+        "Primer / probe concentration helper",
+        "Inventory tracker (Pro)",
+        "Reagent stability predictor",
+        "Dilution series visualizer",
+        "Notebook generator (PDF/MD)",
+        "Osmolarity calculator",
+        "Spectrophotometry toolbox",
+        "Solution density converter",
+        "Reagent compatibility checker",
     ],
 )
 
@@ -961,7 +1056,260 @@ elif mode == "Aliquot splitter":
             st.info(f"{dead_vol_ml} mL reserved as dead volume.")
 
 # ======================================================================
-# 17) STORAGE / STABILITY
+# 17) PROTEIN EXTINCTION / MW FROM SEQUENCE
+# ======================================================================
+elif mode== "Protein extinction / MW from sequence":
+    st.subheader("Protein extinction / MW from sequence")
+    seq = st.text_area("Paste amino acid sequence (one letter)", height=160,
+                       placeholder="MAGRSGT... (letters: ACDEFGHIKLMNPQRSTVWY)")
+    if seq.strip():
+        props = protein_props_from_seq(seq)
+        st.write(f"**Length:** {props['length']} aa")
+        st.write(f"**Tryptophan:** {props['nW']}, **Tyrosine:** {props['nY']}, **Cystine (pairs):** {props['nCystine']}")
+        st.write(f"**ε(280 nm):** {props['epsilon']:.0f} M⁻¹·cm⁻¹")
+        st.write(f"**Molecular weight:** {props['mw']:.1f} Da")
+        A = st.number_input("Measured A280", value=0.5, min_value=0.0)
+        path = st.number_input("Pathlength (cm)", value=1.0, min_value=0.01)
+        if props['epsilon']>0 and path>0:
+            conc_M = A / (props['epsilon']*path)
+            st.success(f"Estimated concentration: **{conc_M*1e6:.2f} µM**")
+
+# ======================================================================
+# 18) pH & BUFFER CAPACITY
+# ======================================================================
+elif mode == "pH & buffer capacity":
+    st.subheader("pH & buffer capacity (monoprotic)")
+    pKa = st.number_input("pKa", value=7.21, help="e.g., Tris ~8.1, Acetate ~4.76, Phosphate pKa2 ~7.21")
+    acid = st.number_input("Acid form [HA] (mM)", value=50.0, min_value=0.0)
+    base = st.number_input("Base form [A-] (mM)", value=50.0, min_value=0.0)
+    pH = hh_pH(pKa, base/1000.0, acid/1000.0)
+    if pH is not None:
+        st.success(f"Predicted pH: **{pH:.2f}**")
+        # crude buffer capacity around pH = pKa: β ≈ 2.3·C_total·(Ka·[H+])/([H+]+Ka)^2
+        Ka = 10**(-pKa)
+        H = 10**(-pH)
+        Ctot = (acid+base)/1000.0  # M
+        beta = 2.303 * Ctot * (Ka*H)/((H+Ka)**2)
+        st.write(f"Approx. buffer capacity near this pH: **{beta:.4f} mol·L⁻¹·pH⁻¹** (higher is more resistant to pH change)")
+
+# ======================================================================
+# 19) CELL CULTURE MEDIA DESIGNER
+# ======================================================================
+elif mode == "Cell culture media designer":
+    st.subheader("Cell culture media designer")
+    cell = st.selectbox("Cell type", ["HEK293", "CHO", "Drosophila S2", "Primary neurons", "Custom"])
+    serum = st.slider("Serum (FBS, %)", 0, 20, 10)
+    antibiotics = st.checkbox("Pen/Strep (1×)", value=True)
+    glutamine = st.checkbox("L-Glutamine (2 mM)", value=True)
+    notes = ""
+    if cell == "HEK293":
+        base = "DMEM high glucose"
+        notes = "Optional: 1 mM sodium pyruvate."
+    elif cell == "CHO":
+        base = "Ham's F12 or DMEM/F12"
+    elif cell == "Drosophila S2":
+        base = "Schneider’s Drosophila Medium"
+        serum = max(serum, 10)
+    elif cell == "Primary neurons":
+        base = "Neurobasal + B27"
+        serum = 0
+        glutamine = True
+    else:
+        base = st.text_input("Base medium", "DMEM/F12")
+    st.markdown("### Recipe")
+    st.write(f"- Base medium: **{base}**")
+    st.write(f"- Serum: **{serum}%**")
+    if antibiotics: st.write("- Pen/Strep: **1×**")
+    if glutamine: st.write("- L-Glutamine: **2 mM**")
+    if notes: st.info(notes)
+
+# ======================================================================
+# 20) PRIMER / PROBE CONCENTRATION HELPER
+# ======================================================================
+elif mode == "Primer / probe concentration helper":
+    st.subheader("Primer / probe concentration helper")
+    stock_unit = st.selectbox("Stock unit", ["µM", "ng/µL"])
+    if stock_unit == "µM":
+        stock = st.number_input("Stock (µM)", value=100.0, min_value=0.0)
+        target = st.number_input("Working (µM)", value=0.5, min_value=0.0)
+        final_vol = st.number_input("Final volume (µL)", value=20.0, min_value=1.0)
+        v_stock = (target * final_vol) / stock if stock>0 else 0
+        st.success(f"Add **{v_stock:.2f} µL** stock + **{final_vol - v_stock:.2f} µL** buffer to reach {target} µM.")
+    else:
+        mw_bp = st.number_input("Oligo MW (g/mol) or use approx 330×nt", value=330.0*20, min_value=1.0)
+        stock_ng = st.number_input("Stock (ng/µL)", value=100.0, min_value=0.0)
+        # Convert ng/µL → µM: µM = (ng/µL) / (MW g/mol) * (10^3 µL/mL) * (10^6 µmol/mol)
+        stock_uM = (stock_ng/1e9) / (mw_bp) * 1e6 * 1e3
+        st.write(f"Approx stock: **{stock_uM:.2f} µM**")
+        target = st.number_input("Working (µM)", value=0.5, min_value=0.0)
+        final_vol = st.number_input("Final volume (µL)", value=20.0, min_value=1.0)
+        v_stock = (target * final_vol) / stock_uM if stock_uM>0 else 0
+        st.success(f"Add **{v_stock:.2f} µL** stock + **{final_vol - v_stock:.2f} µL** buffer to reach {target} µM.")
+
+# ======================================================================
+# 21) INVENTORY TRACKER (Pro)
+# ======================================================================
+elif mode == "Inventory tracker (Pro)":
+    st.subheader("Inventory tracker (Pro)")
+    st.caption("Simple local tracker. If Supabase is configured, you can map this to a table later.")
+    if "inventory" not in st.session_state:
+        st.session_state["inventory"] = []
+    with st.form("add_item"):
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            name = st.text_input("Name", "")
+            conc = st.text_input("Concentration (e.g., 10 mM)", "")
+        with c2:
+            loc = st.text_input("Location (e.g., -20°C box A1)", "")
+            vol = st.text_input("Volume (e.g., 1 mL)", "")
+        with c3:
+            expiry = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=180))
+            submit = st.form_submit_button("Add")
+    if submit and name:
+        st.session_state["inventory"].append(dict(name=name, conc=conc, volume=vol, location=loc, expiry=str(expiry)))
+        st.success("Added.")
+    if st.session_state["inventory"]:
+        st.dataframe(st.session_state["inventory"])
+
+# ======================================================================
+# 22) REAGENT STABILITY PREDICTOR
+# ======================================================================
+elif mode == "Reagent stability predictor":
+    st.subheader("Reagent stability predictor")
+    txt = st.text_area("Describe reagent & conditions", placeholder="e.g., Retinal in EtOH, room light, 4°C storage")
+    if txt.strip():
+        t = txt.lower()
+        tips = []
+        if "retinal" in t or "retinoic" in t:
+            tips += ["Light-sensitive: wrap in foil/amber, use dry solvent, store −20°C."]
+        if "dye" in t or "fluorescein" in t or "rhodamine" in t:
+            tips += ["Avoid repeated freeze–thaw; consider aliquots."]
+        if "enzyme" in t:
+            tips += ["Keep on ice during set-up; glycerol may stabilize."]
+        if "aqueous" in t and "dmso" in t:
+            tips += ["Gradually pre-dilute in DMSO, then add to aqueous media to avoid precipitation."]
+        if tips:
+            for t in tips: st.write("•", t)
+        else:
+            st.info("No specific rule matched. Use general best practices.")
+
+# ======================================================================
+# 23) DILUTION SERIES VISUALIZER
+# ======================================================================
+elif mode == "Dilution series visualizer":
+    st.subheader("Dilution series visualizer")
+    start = st.number_input("Start concentration (µM)", value=100.0, min_value=0.0001)
+    factor = st.number_input("Dilution factor", value=2.0, min_value=1.001)
+    steps = st.number_input("Steps", value=8, min_value=1, step=1)
+    concs = [start/(factor**i) for i in range(int(steps))]
+    df = pd.DataFrame({"step": list(range(1,int(steps)+1)), "concentration_µM": concs})
+    st.dataframe(df)
+    st.line_chart(df.set_index("step"))
+
+# ======================================================================
+# 24) NOTEBOOK GENERATOR (PDF/MD)
+# ======================================================================
+elif mode == "Notebook generator (PDF/MD)":
+    st.subheader("Notebook generator (PDF/MD)")
+    title = st.text_input("Title", "Dilution of compound X")
+    purpose = st.text_area("Purpose", "Prepare dilution series for IC50 assay.")
+    steps = st.text_area("Steps (one per line)", "Label tubes\nPipette stock\nAdd buffer\nMix gently")
+    content = f"# {title}\n\n## Purpose\n{purpose}\n\n## Steps\n" + "\n".join([f"- {s}" for s in steps.splitlines() if s.strip()])
+    st.download_button("⬇ Download Markdown", data=content.encode("utf-8"), file_name="notebook_entry.md")
+    if 'HAS_FPDF' in globals() and HAS_FPDF:
+        if st.button("📄 Export as PDF"):
+            pdf_bytes = make_pdf_report(title, [purpose, "", "Steps:"] + steps.splitlines())
+            st.download_button("⬇ Download PDF", data=pdf_bytes, file_name="notebook_entry.pdf")
+    else:
+        st.info("Install `fpdf` to enable PDF export.")
+
+# ======================================================================
+# 25) OSMOLARITY CALCULATOR
+# ======================================================================
+elif mode == "Osmolarity calculator":
+    st.subheader("Osmolarity calculator")
+    st.caption("Enter solutes and concentrations (mM). i = van’t Hoff factor (auto for common solutes).")
+    names_default = ["NaCl", "KCl", "Glucose"]
+    with st.form("osm"):
+        rows_n = st.number_input("Number of components", value=3, min_value=1, step=1)
+        comps = []
+        for i in range(rows_n):
+            c1,c2 = st.columns([2,1])
+            with c1:
+                name = st.text_input(f"Name {i+1}", value=names_default[i] if i<len(names_default) else "")
+            with c2:
+                C = st.number_input(f"C (mM) {i+1}", value=100.0 if i==0 else 0.0, min_value=0.0)
+            comps.append({"name": name, "C_mM": C})
+        go = st.form_submit_button("Calculate")
+    if go:
+        Osm = osmolarity(comps)     # Osm/L
+        st.success(f"Estimated osmolarity: **{Osm*1000:.1f} mOsm/L**")
+
+# ======================================================================
+# 26) SPECTROPHOTOMETRY TOOLBOX
+# ======================================================================
+elif mode == "Spectrophotometry toolbox":
+    st.subheader("Spectrophotometry toolbox (standard curve)")
+    st.caption("Upload CSV with two columns: concentration, absorbance")
+    up = st.file_uploader("Upload CSV", type=["csv"])
+    if up is not None:
+        df = pd.read_csv(up)
+        st.dataframe(df.head())
+        if {"concentration","absorbance"}.issubset({c.lower() for c in df.columns}):
+            # robust column access
+            colmap = {c.lower(): c for c in df.columns}
+            x = df[colmap["concentration"]].values.tolist()
+            y = df[colmap["absorbance"]].values.tolist()
+            fit = simple_linreg(x,y)
+            if fit:
+                st.write(f"Slope: **{fit['slope']:.6f}**, Intercept: **{fit['intercept']:.6f}**, R²: **{fit['r2']:.4f}**")
+                st.info("Use: concentration = (A - intercept) / slope")
+            else:
+                st.warning("Could not fit line — check data.")
+        else:
+            st.error("CSV must have columns named 'concentration' and 'absorbance'.")
+
+# ======================================================================
+# 27) SOLUTION DENSITY CONVERTER
+# ======================================================================
+elif mode == "Solution density converter":
+    st.subheader("Solution density converter")
+    sol = st.selectbox("Solvent", ["water","ethanol_100%","ethanol_70%","glycerol_100%","dmso_100%","acetone_100%","custom"])
+    if sol=="custom":
+        dens = st.number_input("Density (g/mL)", value=1.0, min_value=0.5, max_value=2.0)
+    else:
+        dens = DENSITY.get(sol, 1.0)
+    st.write(f"Using density: **{dens:.3f} g/mL**")
+    direction = st.radio("Convert", ["% w/v → g/L and M", "M → % w/v (approx)"])
+    if direction == "% w/v → g/L and M":
+        percent = st.number_input("% w/v (g/100 mL)", value=10.0, min_value=0.0)
+        mw = st.number_input("MW (g/mol)", value=180.16, min_value=1.0)
+        g_per_L = percent * 10.0  # g/100 mL → g/L
+        M = g_per_L / mw
+        st.success(f"{percent}% w/v ≈ **{g_per_L:.1f} g/L** (≈ **{M:.3f} M**)")
+    else:
+        M = st.number_input("Molarity (M)", value=1.0, min_value=0.0)
+        mw = st.number_input("MW (g/mol)", value=180.16, min_value=1.0)
+        g_per_L = M * mw
+        percent = g_per_L / 10.0
+        st.success(f"{M} M ≈ **{g_per_L:.1f} g/L** (≈ **{percent:.1f}% w/v**)")
+
+# ======================================================================
+# 28) REAGENT COMPATIBILITY CHECKER
+# ======================================================================
+elif mode == "Reagent compatibility checker":
+    st.subheader("Reagent compatibility checker")
+    txt = st.text_area("Describe your planned mix", placeholder="e.g., Phosphate buffer with calcium chloride and ethanol…")
+    if st.button("Check"):
+        hits = check_compatibility(txt)
+        if hits:
+            for h in hits:
+                st.warning(h)
+        else:
+            st.success("No issues found in our simple rule set. (Always double-check your specific system.)")
+
+# ======================================================================
+# 29) STORAGE / STABILITY
 # ======================================================================
 else:  # "Storage / stability helper"
     st.subheader("Storage / stability helper")
