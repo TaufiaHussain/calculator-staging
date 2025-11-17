@@ -1568,38 +1568,79 @@ else:
 
     # --- (D) DataLens Cloud ---
     with tab_cloud:
-        st.subheader("Cloud uploads & recent runs")
-        cfile = st.file_uploader("Upload to cloud", key="cloud_up", type=["png", "jpg", "jpeg", "csv", "pdf"])
-        if cfile:
-            content = cfile.read()
-            path = f"{int(time.time())}_{cfile.name}"
-            try:
-                supabase.storage.from_("datalens-uploads").upload(path, content)
-                supabase.table("uploads").insert(
-                    {
-                        "user_id": user.id,
-                        "filename": cfile.name,
-                        "mime_type": cfile.type,
-                        "storage_path": path,
-                        "bytes": len(content),
-                    }
-                ).execute()
-                st.success(f"Uploaded: {cfile.name}")
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
+       st.subheader("Cloud uploads & recent runs")
 
+    # 1) Upload to storage + log in uploads table
+    cfile = st.file_uploader(
+        "Upload to cloud",
+        key="cloud_up",
+        type=["png", "jpg", "jpeg", "csv", "pdf"],
+    )
+    if cfile:
+        content = cfile.read()
+        path = f"{int(time.time())}_{cfile.name}"
         try:
-            runs = (
-                supabase.table("runs")
-                .select("*")
-                .eq("user_id", user.id)
-                .order("created_at", desc=True)
-                .limit(20)
-                .execute()
-            )
-            st.dataframe(pd.DataFrame(runs.data) if runs.data else pd.DataFrame())
-        except Exception:
-            st.info("No runs yet.")
+            # 👇 use the same bucket name you actually created
+            supabase.storage.from_("datalens-secure-uploads").upload(path, content)
+            supabase.table("uploads").insert(
+                {
+                    "user_id": user.id,
+                    "filename": cfile.name,
+                    "mime_type": cfile.type,
+                    "storage_path": path,
+                    "bytes": len(content),
+                }
+            ).execute()
+            st.success(f"Uploaded: {cfile.name}")
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
+
+    # 2) List recent uploads for this user (with signed URLs)
+    try:
+        up_res = (
+            supabase.table("uploads")
+            .select("id, filename, mime_type, storage_path, created_at")
+            .eq("user_id", user.id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        uploads = up_res.data or []
+
+        st.markdown("### Your recent uploads")
+
+        if not uploads:
+            st.info("No uploads yet.")
+        else:
+            for row in uploads:
+                # 👇 bucket name must match the one you upload to
+                res = supabase.storage.from_("datalens-secure-uploads").create_signed_url(
+                    row["storage_path"], 3600  # 1 hour
+                )
+                url = res["signedURL"]  # or res["signed_url"] depending on client version
+
+                if row["mime_type"].startswith("image/"):
+                    st.image(url, caption=row["filename"], width=300)
+                else:
+                    st.markdown(f"📄 [{row['filename']}]({url})")
+
+    except Exception as e:
+        st.error(f"Could not load uploads: {e}")
+
+    # 3) Show recent calculation runs
+    try:
+        runs = (
+            supabase.table("runs")
+            .select("*")
+            .eq("user_id", user.id)
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        st.markdown("### Recent calculator runs")
+        st.dataframe(pd.DataFrame(runs.data) if runs.data else pd.DataFrame())
+    except Exception:
+        st.info("No runs yet.")
 
     # --- (E) API keys ---
     with tab_keys:
