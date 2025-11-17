@@ -1489,18 +1489,18 @@ else:
         st.subheader("Batch calculator (CSV)")
         st.code(
             """mode,stock_mM,target_mM,final_ul
-single_dilution,10,0.01,300
+               single_dilution,10,0.01,300
 
-mode,mg_per_ml,mw
-mgml_to_mM,1,284.44
+               mode,mg_per_ml,mw
+               mgml_to_mM,1,284.44
 
-mode,mM,mw
-mM_to_mgml,10,284.44
-""",
+               mode,mM,mw
+               mM_to_mgml,10,284.44
+            """,
             language="csv",
         )
 
-        up = st.file_uploader("Upload CSV", type=["csv"])
+        up = st.file_uploader("Upload CSV", type=["csv"], key="batch_csv")
         if up is not None:
             df_in = pd.read_csv(up)
             out_rows = []
@@ -1548,7 +1548,7 @@ mM_to_mgml,10,284.44
                 "and run OCR locally on your own computer."
             )
 
-        image_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"])
+        image_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"], key="image_ocr")
 
         if image_file is not None:
             if HAS_OCR:
